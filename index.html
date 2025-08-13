@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Arc-Fractal Tree — 3D Curved Branches (Presets)</title>
+  <meta name="description" content="Interactive 3D arc-fractal tree with presets (Phi 120, Phi 90, Phi 144, Phi 72). Optional uniform color drift." />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { background:#0b0e13; color:#e7eaee; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    #app { position: fixed; inset: 0; }
+    .overlay { position: fixed; left: 12px; top: 12px; z-index: 10; display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+    .btn { appearance:none; border:1px solid #2a3240; background:#12161c; color:#dfe6f1; padding:6px 10px; border-radius:10px; cursor:pointer; font-size:12px }
+    .btn:hover{ background:#161c24; }
+    .hint { position: fixed; left: 12px; bottom: 12px; opacity: 0.75; font-size: 12px; }
+    .brand { position: fixed; right: 12px; bottom: 12px; opacity: 0.8; font-size: 12px; color:#b9c0c9; }
+  </style>
+
+  <!-- Static-host friendly import map -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19/dist/lil-gui.esm.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div class="overlay">
+    <button id="resetBtn" class="btn">Reset view</button>
+    <button id="testBtn" class="btn">Run tests</button>
+  </div>
+  <div class="hint">Drag = orbit · Shift+Drag = pan · Wheel/pinch = zoom · Press <b>S</b> to save a PNG</div>
+  <div class="brand">Arc-Fractal Tree · Three.js</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+
+    // ---------- Scene ----------
+    const container = document.getElementById('app');
+
+    // WebGL fallback for restricted sandboxes
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    } catch (e) {
+      const msg = document.createElement('div');
+      msg.style.cssText = 'position:fixed;inset:0;display:grid;place-items:center;background:#0b0e13;color:#ffcdd2;font:14px/1.4 system-ui;text-align:center;padding:24px';
+      msg.innerHTML = 'WebGL is unavailable in this environment. Please open this page in a modern browser with WebGL enabled.';
+      document.body.appendChild(msg);
+      throw e;
+    }
+
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    container.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e13);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 2000);
+    camera.position.set(5, 5, 10);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.07;
+    controls.target.set(0, 1.5, 0);
+
+    scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x22222a, 0.7));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.85);
+    dirLight.position.set(6, 10, 6);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(60, 60, 0x2b3140, 0x1a202c);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const root = new THREE.Group();
+    scene.add(root);
+
+    // ---------- Colors (ROYGBIV; uniform drift only) ----------
+    const RAINBOW_HUES = [0, 30, 60, 120, 210, 275, 300]; // ensures orange/yellow
+    const levelMats = [];
+    let hueShift = 0; // degrees; applied uniformly when drift enabled
+
+    function baseHueForLevel(level){
+      return (RAINBOW_HUES[level % RAINBOW_HUES.length] + hueShift) % 360;
+    }
+    function getLevelMaterial(level){
+      if (!levelMats[level]){
+        const hueDeg = baseHueForLevel(level);
+        const color = new THREE.Color().setHSL(hueDeg/360, 0.9, 0.55);
+        levelMats[level] = new THREE.MeshStandardMaterial({ color, metalness: 0.25, roughness: 0.5 });
+      }
+      return levelMats[level];
+    }
+    function updateMaterialColors(){
+      for (let i=0; i<levelMats.length; i++){
+        const mat = levelMats[i];
+        if (!mat) continue;
+        const hueDeg = baseHueForLevel(i);
+        mat.color.setHSL(hueDeg/360, 0.9, 0.55);
+      }
+    }
+
+    // ---------- Math helpers ----------
+    function orthonormalize(T, N){
+      const t = T.clone().normalize();
+      let n = N.clone().sub(t.clone().multiplyScalar(t.dot(N)));
+      if (n.lengthSq() < 1e-9){
+        const tmp = Math.abs(t.x) < 0.9 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+        n = tmp.sub(t.clone().multiplyScalar(t.dot(tmp)));
+      }
+      n.normalize();
+      const u = new THREE.Vector3().crossVectors(n, t).normalize();
+      return { t, n, u };
+    }
+    function quatFromTN(T, N){
+      const { t, n } = orthonormalize(T, N);
+      const y = new THREE.Vector3().crossVectors(n, t).normalize();
+      const m = new THREE.Matrix4();
+      m.makeBasis(t, y, n); // X=tangent, Y=binormal, Z=normal
+      return new THREE.Quaternion().setFromRotationMatrix(m);
+    }
+
+    class LocalArcCurve extends THREE.Curve {
+      constructor(radius=1, angleRad=Math.PI/3){ super(); this.r = radius; this.a = angleRad; }
+      getPoint(t){
+        const a = this.a * t;
+        return new THREE.Vector3(this.r*Math.sin(a), this.r*(1 - Math.cos(a)), 0);
+      }
+      getTangent(t){
+        const a = this.a * t;
+        return new THREE.Vector3(Math.cos(a), Math.sin(a), 0).normalize();
+      }
+    }
+
+    // Build one arc tube; returns end pose for chaining
+    function addArc(P, T, N, radius, arcAngleRad, tubeRadius, tubularSegments, radialSegments, azimuthDeg=0, tiltDeg=0, level=0){
+      const { t: Tn, n: N0 } = orthonormalize(T, N);
+      const qAz = new THREE.Quaternion().setFromAxisAngle(Tn, THREE.MathUtils.degToRad(azimuthDeg));
+      const N_az = N0.clone().applyQuaternion(qAz);
+      const U_az = new THREE.Vector3().crossVectors(N_az, Tn).normalize();
+      const qTilt = new THREE.Quaternion().setFromAxisAngle(U_az, THREE.MathUtils.degToRad(tiltDeg));
+      const N_final = N_az.clone().applyQuaternion(qTilt);
+      const qOrient = quatFromTN(Tn, N_final);
+
+      const curve = new LocalArcCurve(radius, arcAngleRad);
+      const geom = new THREE.TubeGeometry(curve, Math.max(2, tubularSegments|0), tubeRadius, Math.max(3, radialSegments|0), false);
+      const mesh = new THREE.Mesh(geom, getLevelMaterial(level));
+      mesh.quaternion.copy(qOrient);
+      mesh.position.copy(P);
+      root.add(mesh);
+
+      const endLocal = curve.getPoint(1).clone();
+      const tanLocal = curve.getTangent(1).clone();
+      const endWorld = endLocal.applyQuaternion(qOrient).add(P);
+      const tanWorld = tanLocal.applyQuaternion(qOrient).normalize();
+      const normalWorld = new THREE.Vector3(0,0,1).applyQuaternion(qOrient).normalize();
+
+      return { end: endWorld, dir: tanWorld, normal: normalWorld };
+    }
+
+    function clear(obj){
+      for (let i = obj.children.length - 1; i >= 0; i--) {
+        const c = obj.children[i];
+        c.geometry && c.geometry.dispose && c.geometry.dispose();
+        obj.remove(c);
+      }
+    }
+    function estimateMeshes(depth, bps){
+      let total = 1, pow = 1;
+      for (let i=1; i<=depth; i++) { pow *= bps; total += pow; }
+      return total;
+    }
+
+    // ---------- Params & GUI ----------
+    const PHI = (1 + Math.sqrt(5)) / 2;
+
+    const params = {
+      // Structure
+      depth: 1,
+      arcAngleDeg: 60,
+      branchAzimuthDeg: 60,
+      lockBranchesToAzimuth: true,
+      branchesPerSplit: 6,
+
+      // Scaling
+      scalePreset: 'phi^-1',
+      scalePerLevel: 1/PHI,
+
+      // Geometry
+      thickness: 0.1,
+      radiusStart: 1.2,
+      tubularSegments: 36,
+      radialSegments: 10,
+
+      // Orientation
+      tiltDeg: 0,
+      twistOffsetDeg: 0,
+      randomTwistJitterDeg: 0,
+
+      // Safety
+      maxMeshEstimate: 30000,
+
+      // Presets
+      preset: 'Custom',
+
+      // Color animation (uniform only)
+      colorDrift: false,
+      colorDriftSpeed: 0.30
+    };
+
+    const gui = new GUI({ title: 'Arc-Fractal Tree' });
+
+    const gPresets = gui.addFolder('Presets');
+    const presetCtrl = gPresets.add(params, 'preset', ['Custom','Phi 120','Phi 90','Phi 144','Phi 72']).name('Choose preset');
+
+    const gStruct = gui.addFolder('Structure');
+    const depthCtrl = gStruct.add(params, 'depth', 0, 7, 1).name('Depth');
+    const arcCtrl   = gStruct.add(params, 'arcAngleDeg', 5, 150, 1).name('Arc angle (°)');
+    const azCtrl    = gStruct.add(params, 'branchAzimuthDeg', 5, 180, 1).name('Azimuth step (°)');
+    const lockCtrl  = gStruct.add(params, 'lockBranchesToAzimuth').name('Lock branches = 360/step');
+    const bpsCtrl   = gStruct.add(params, 'branchesPerSplit', 1, 360, 1).name('Branches per split');
+
+    const scaleOptions = [
+      'phi^-1','phi^-2','phi^-3','phi^-4',
+      'silver^-1','silver^-2','silver^-3','silver^-4',
+      'plastic^-1','plastic^-2','plastic^-3','plastic^-4',
+      'custom'
+    ];
+    const SILVER = 1 + Math.SQRT2;
+    const PLASTIC = 1.3247179572447458;
+
+    const gScale = gui.addFolder('Scaling');
+    const presetScaleCtrl = gScale.add(params, 'scalePreset', scaleOptions).name('Scale preset');
+    const scaleCtrl       = gScale.add(params, 'scalePerLevel', 0.1, 0.9, 0.0001).name('Scale per level');
+
+    const gGeom = gui.addFolder('Geometry');
+    gGeom.add(params, 'thickness', 0.01, 0.5, 0.001).name('Tube thickness');
+    gGeom.add(params, 'radiusStart', 0.2, 4.0, 0.01).name('Start radius');
+    gGeom.add(params, 'tubularSegments', 8, 128, 1).name('Arc segments');
+    gGeom.add(params, 'radialSegments', 3, 24, 1).name('Tube sides');
+
+    const gOrient = gui.addFolder('Orientation');
+    gOrient.add(params, 'tiltDeg', -80, 80, 1).name('Tilt (°)');
+    gOrient.add(params, 'twistOffsetDeg', 0, 360, 1).name('Twist offset (°)');
+    gOrient.add(params, 'randomTwistJitterDeg', 0, 90, 1).name('Twist jitter (°)');
+
+    const gColor = gui.addFolder('Color');
+    gColor.add(params, 'colorDrift').name('Enable color drift');
+    gColor.add(params, 'colorDriftSpeed', 0.05, 2.0, 0.05).name('Drift speed');
+
+    function applyScalePreset(){
+      const k = params.scalePreset;
+      if (k === 'custom') return;
+      const [name, powStr] = k.split('^-');
+      const p = Math.max(1, parseInt(powStr||'1',10));
+      const base = name === 'phi' ? PHI : (name === 'silver' ? SILVER : (name === 'plastic' ? PLASTIC : PHI));
+      params.scalePerLevel = 1 / (base ** p);
+      scaleCtrl.updateDisplay();
+    }
+    function syncBranchesLock(){
+      if (params.lockBranchesToAzimuth){
+        params.branchesPerSplit = Math.max(1, Math.floor(360 / Math.max(5, params.branchAzimuthDeg)));
+        bpsCtrl.updateDisplay();
+        bpsCtrl.disable();
+      } else {
+        bpsCtrl.enable();
+      }
+    }
+    function applyPresetByName(name){
+      if (name === 'Phi 120'){
+        params.depth = 7;
+        params.arcAngleDeg = 120;
+        params.branchAzimuthDeg = 120; // 3-way
+        params.lockBranchesToAzimuth = true;
+        params.scalePreset = 'phi^-1';
+        params.thickness = 0.04;
+        params.tiltDeg = 0;
+      } else if (name === 'Phi 90'){
+        params.depth = 6;               // 4-way, depth 6 stays fast
+        params.arcAngleDeg = 90;
+        params.branchAzimuthDeg = 90;
+        params.lockBranchesToAzimuth = true;
+        params.scalePreset = 'phi^-1';
+        params.thickness = 0.02;
+        params.tiltDeg = 0;
+      } else if (name === 'Phi 144'){
+        params.depth = 6;
+        params.arcAngleDeg = 144;
+        params.branchAzimuthDeg = 72;   // 5-way
+        params.lockBranchesToAzimuth = true;
+        params.scalePreset = 'phi^-2';
+        params.thickness = 0.04;
+        params.tiltDeg = 0;
+      } else if (name === 'Phi 72'){
+        params.depth = 7;
+        params.arcAngleDeg = 72;
+        params.branchAzimuthDeg = 120;  // 3-way
+        params.lockBranchesToAzimuth = true;
+        params.scalePreset = 'phi^-1';
+        params.thickness = 0.02;
+        params.tiltDeg = 0;
+      }
+      applyScalePreset();
+      syncBranchesLock();
+      gui.controllersRecursive().forEach(c=>c.updateDisplay?.());
+      buildTree();
+    }
+
+    [depthCtrl, arcCtrl].forEach(ctrl=>ctrl.onChange(buildTree));
+    azCtrl.onChange(()=>{ syncBranchesLock(); buildTree(); });
+    lockCtrl.onChange(()=>{ syncBranchesLock(); buildTree(); });
+    bpsCtrl.onChange(buildTree);
+    presetScaleCtrl.onChange(()=>{ applyScalePreset(); buildTree(); });
+    scaleCtrl.onChange(buildTree);
+    gGeom.onChange(buildTree);
+    gOrient.onChange(buildTree);
+    presetCtrl.onChange((value)=>{ if (value !== 'Custom') applyPresetByName(value); });
+
+    document.getElementById('resetBtn').addEventListener('click', ()=>{
+      camera.position.set(5, 5, 10);
+      controls.target.set(0, 1.5, 0);
+      controls.update();
+    });
+
+    // ---------- Build ----------
+    function buildTree(){
+      clear(root);
+      // Reset materials so drift starts from correct base hues
+      levelMats.length = 0;
+
+      const depth = Math.min(7, params.depth|0);
+      const branchStepDeg = Math.max(5, params.branchAzimuthDeg);
+      const branchesPerSplit = params.lockBranchesToAzimuth
+        ? Math.max(1, Math.floor(360 / branchStepDeg))
+        : (params.branchesPerSplit|0);
+
+      const est = estimateMeshes(depth, branchesPerSplit);
+      if (est > params.maxMeshEstimate){
+        console.warn(`Build skipped: estimated ${est} meshes exceeds cap (${params.maxMeshEstimate}). Lower depth/branches or increase cap.`);
+        return;
+      }
+
+      const arcAngleRad = THREE.MathUtils.degToRad(params.arcAngleDeg);
+      const tubeBase = Math.max(0.003, params.thickness);
+      const tubularSegments = params.tubularSegments|0;
+      const radialSegments = params.radialSegments|0;
+      const radius0 = Math.max(0.05, params.radiusStart);
+
+      const stack = [];
+      const startPos = new THREE.Vector3(0, 0.01, 0);
+      const startT = new THREE.Vector3(0, 1, 0);
+      const startN = new THREE.Vector3(0, 0, 1);
+
+      const trunk = addArc(startPos, startT, startN, radius0, arcAngleRad, tubeBase, tubularSegments, radialSegments, 0, params.tiltDeg, 0);
+      stack.push({level:1, P: trunk.end, T: trunk.dir, N: trunk.normal, r: radius0 * params.scalePerLevel, t: tubeBase * 0.9});
+
+      while (stack.length){
+        const node = stack.pop();
+        const { level, P, T, N } = node;
+        if (level > depth) continue;
+
+        for (let i=0;i<branchesPerSplit;i++){
+          const jitter = (Math.random()*2-1) * params.randomTwistJitterDeg;
+          const az = params.twistOffsetDeg + i * branchStepDeg + jitter;
+          const seg = addArc(P, T, N, node.r, arcAngleRad, Math.max(0.002, node.t), tubularSegments, radialSegments, az, params.tiltDeg, level);
+          stack.push({level: level + 1, P: seg.end, T: seg.dir, N: seg.normal, r: node.r * params.scalePerLevel, t: node.t * params.scalePerLevel * 0.92});
+        }
+      }
+    }
+
+    // Initial build
+    buildTree();
+
+    // Resize & loop
+    window.addEventListener('resize', ()=>{
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+    window.addEventListener('keydown', (e)=>{
+      if (e.key.toLowerCase() === 's') {
+        const a = document.createElement('a');
+        a.href = renderer.domElement.toDataURL('image/png');
+        a.download = 'arc-fractal-tree.png';
+        a.click();
+      }
+    });
+
+    renderer.setAnimationLoop(()=>{
+      if (params.colorDrift) {
+        hueShift = (hueShift + params.colorDriftSpeed) % 360;
+        updateMaterialColors();
+      }
+      controls.update();
+      renderer.render(scene, camera);
+    });
+
+    // ---------- Minimal tests ----------
+    function runSelfTests(){
+      console.groupCollapsed('%cArc-Fractal Tree · Tests','color:#7bdfff');
+      try {
+        console.assert(THREE && typeof THREE.WebGLRenderer === 'function', 'three imported');
+        console.assert(typeof OrbitControls === 'function', 'OrbitControls imported');
+
+        applyPresetByName('Phi 120');
+        console.assert(
+          params.depth === 7 && params.arcAngleDeg === 120 && params.branchAzimuthDeg === 120 &&
+          params.scalePreset==='phi^-1' && Math.abs(params.thickness-0.04)<1e-6,
+          'Phi 120 preset set'
+        );
+
+        applyPresetByName('Phi 90');
+        console.assert(
+          params.depth === 6 && params.arcAngleDeg === 90 && params.branchAzimuthDeg === 90 &&
+          params.scalePreset==='phi^-1' && Math.abs(params.thickness-0.02)<1e-6,
+          'Phi 90 preset set'
+        );
+
+        applyPresetByName('Phi 144');
+        console.assert(
+          params.depth === 6 && params.arcAngleDeg === 144 && params.branchAzimuthDeg === 72 &&
+          params.scalePreset==='phi^-2' && Math.abs(params.thickness-0.04)<1e-6,
+          'Phi 144 preset set'
+        );
+
+        applyPresetByName('Phi 72');
+        console.assert(
+          params.depth === 7 && params.arcAngleDeg === 72 && params.branchAzimuthDeg === 120 &&
+          params.scalePreset==='phi^-1' && Math.abs(params.thickness-0.02)<1e-6,
+          'Phi 72 preset set'
+        );
+
+        // Branch lock math
+        params.lockBranchesToAzimuth = true; params.branchAzimuthDeg = 120; syncBranchesLock();
+        console.assert(params.branchesPerSplit === 3, 'Azimuth 120 → 3 branches');
+        params.branchAzimuthDeg = 90; syncBranchesLock();
+        console.assert(params.branchesPerSplit === 4, 'Azimuth 90 → 4 branches');
+        params.branchAzimuthDeg = 72; syncBranchesLock();
+        console.assert(params.branchesPerSplit === 5, 'Azimuth 72 → 5 branches');
+
+        // Color drift sanity (uniform)
+        const m0 = getLevelMaterial(0), hsl = {h:0,s:0,l:0};
+        m0.color.getHSL(hsl); const h1 = hsl.h;
+        params.colorDrift = true; params.colorDriftSpeed = 1.0; hueShift = 0; updateMaterialColors();
+        hueShift = (hueShift + params.colorDriftSpeed) % 360; updateMaterialColors();
+        m0.color.getHSL(hsl); const h2 = hsl.h;
+        console.assert(Math.abs(h2 - h1) > 1e-6, 'Uniform color drift updates hue');
+
+        console.log('All tests passed ✅');
+      } catch (e){ console.error('Tests failed:', e); }
+      console.groupEnd();
+    }
+    document.getElementById('testBtn').addEventListener('click', runSelfTests);
+  </script>
+</body>
+</html>
