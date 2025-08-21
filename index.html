@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Arc-Fractal Tree — Electric Pulse + Music</title>
+  <meta name="description" content="Arc-fractal tree with welded pivots, per-level counter-rotation, bloom, and generative music triggered by centerline crossings. Includes recording. " />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { background:#0b0e13; color:#e7eaee; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    #app { position: fixed; inset: 0; }
+    .overlay { position: fixed; left: 12px; top: 12px; z-index: 10; display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+    .btn { appearance:none; border:1px solid #2a3240; background:#12161c; color:#dfe6f1; padding:6px 10px; border-radius:10px; cursor:pointer; font-size:12px }
+    .btn:hover{ background:#161c24; }
+    .hint { position: fixed; left: 12px; bottom: 12px; opacity: 0.75; font-size: 12px; }
+    .brand { position: fixed; right: 12px; bottom: 12px; opacity: 0.8; font-size: 12px; color:#b9c0c9; }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "lil-gui": "https://unpkg.com/lil-gui@0.19/dist/lil-gui.esm.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div class="overlay">
+    <button id="resetBtn" class="btn">Reset view</button>
+    <button id="audioBtn" class="btn">Enable sound</button>
+    <button id="recAudioBtn" class="btn">Rec audio</button>
+    <button id="recVideoBtn" class="btn">Rec video</button>
+  </div>
+  <div class="hint">Drag = orbit · Shift+Drag = pan · Wheel/pinch = zoom · Press <b>S</b> to save a PNG</div>
+  <div class="brand">Arc-Fractal Tree · Three.js</div>
+
+  <script type="module">
+    console.log('%cArc-Fractal — recorder integrated','color:#7bdfff');
+
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import GUI from 'lil-gui';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+    // ---------- small helpers ----------
+    function signNonZero(v, eps = 0.01) { return v > eps ? 1 : (v < -eps ? -1 : 0); }
+
+    function createSafeRenderer() {
+      const canvas = document.createElement('canvas');
+      const attrs = { alpha:false, antialias:false, depth:true, stencil:false, preserveDrawingBuffer:false, powerPreference:'default' };
+      const gl = canvas.getContext('webgl2', attrs) ||
+                 canvas.getContext('webgl', attrs)  ||
+                 canvas.getContext('experimental-webgl', attrs);
+      if (!gl) throw new Error('WebGL is unavailable on this system.');
+      const r = new THREE.WebGLRenderer({ canvas, context: gl });
+      r.setPixelRatio(1);
+      r.setSize(window.innerWidth, window.innerHeight);
+      r.outputColorSpace = THREE.SRGBColorSpace;
+      r.toneMapping = THREE.ACESFilmicToneMapping;
+      r.toneMappingExposure = 1.25;
+      return r;
+    }
+
+    // ---------- scene ----------
+    const container = document.getElementById('app');
+    let renderer;
+    try {
+      renderer = createSafeRenderer();
+      container.appendChild(renderer.domElement);
+    } catch (e) {
+      const msg = document.createElement('div');
+      msg.style.cssText = 'position:fixed;inset:0;display:grid;place-items:center;background:#0b0e13;color:#ffcdd2;font:14px/1.5 system-ui;text-align:center;padding:24px';
+      msg.innerHTML = `<div><b>WebGL couldn’t start on this device.</b><br/><br/>Try updating browser/driver or enable hardware acceleration.<br/><br/><small>${e.message}</small></div>`;
+      document.body.appendChild(msg);
+      throw e;
+    }
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e13);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 2000);
+    camera.position.set(5, 5, 10);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.07;
+    controls.target.set(0, 1.5, 0);
+
+    scene.add(new THREE.HemisphereLight(0x8fb4ff, 0x1b1e28, 0.55));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(6, 10, 6);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(60, 60, 0x2b3140, 0x1a202c);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const root = new THREE.Group();
+    scene.add(root);
+
+    // ---------- post-processing ----------
+    let composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    let bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      1.35, 0.35, 0.68
+    );
+    bloomPass.mipmapBlur = false;
+    composer.addPass(bloomPass);
+
+    // ---------- runtime state ----------
+    const Y_UNIT = new THREE.Vector3(0,1,0);
+    const Z_UNIT = new THREE.Vector3(0,0,1);
+    let spinners = [];                 // { pivot, level, lastXSign, lastZSign, lastTimeX, lastTimeZ }
+    let dynamicMats = [];
+    const tmpV = new THREE.Vector3();
+
+    // music state
+    const levelNoteStep = new Map();   // level -> next step idx
+
+    // color/path state
+    const RAINBOW_HUES = [0, 30, 60, 120, 210, 275, 300];
+    let hueShiftDeg = 0;
+    let pulsePos = 0;
+    let totalPathLen = 1;
+    const baseHueForLevel = (lvl)=> RAINBOW_HUES[lvl % RAINBOW_HUES.length];
+
+    // ---------- math helpers ----------
+    function orthonormalize(T, N){
+      const t = T.clone().normalize();
+      let n = N.clone().sub(t.clone().multiplyScalar(t.dot(N)));
+      if (n.lengthSq() < 1e-9){
+        const tmp = Math.abs(t.x) < 0.9 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+        n = tmp.sub(t.clone().multiplyScalar(t.dot(tmp)));
+      }
+      n.normalize();
+      const u = new THREE.Vector3().crossVectors(n, t).normalize();
+      return { t, n, u };
+    }
+    function quatFromTN(T, N){
+      const { t, n } = orthonormalize(T, N);
+      const y = new THREE.Vector3().crossVectors(n, t).normalize();
+      const m = new THREE.Matrix4(); m.makeBasis(t, y, n);
+      return new THREE.Quaternion().setFromRotationMatrix(m);
+    }
+
+    class LocalArcCurve extends THREE.Curve {
+      constructor(radius=1, angleRad=Math.PI/3){ super(); this.r = radius; this.a = angleRad; }
+      getPoint(t){ const a = this.a * t; return new THREE.Vector3(this.r*Math.sin(a), this.r*(1 - Math.cos(a)), 0); }
+      getTangent(t){ const a = this.a * t; return new THREE.Vector3(Math.cos(a), Math.sin(a), 0).normalize(); }
+    }
+
+    // ---------- parameters & presets ----------
+    const PHI = (1 + Math.sqrt(5)) / 2;
+    const SILVER = 1 + Math.SQRT2;
+    const PLASTIC = 1.3247179572447458;
+
+    const params = {
+      preset: 'Phi 120',
+
+      // Structure
+      depth: 6,
+      arcAngleDeg: 120,
+      branchAzimuthDeg: 120,
+      lockBranchesToAzimuth: true,
+      branchesPerSplit: 3,
+
+      // Scaling
+      scalePreset: 'phi^-1',
+      scalePerLevel: 1/PHI,
+
+      // Geometry
+      thickness: 0.072,
+      radiusStart: 1.2,
+      tubularSegments: 36,
+      radialSegments: 10,
+
+      // Safety
+      maxMeshEstimate: 100000,
+
+      // Color
+      colorDrift: true,
+      colorDriftSpeed: 0.5,
+      colorMode: 'Electric pulse',   // Solid | Rainbow (depth) | White pulse | Electric pulse
+      rainbowSpanDeg: 180,
+      pulseSpeed: 2.0,
+      pulseWidth: 0.83,
+
+      // Motion
+      spinRoot: true,
+      spinSpeedDegPerSec: 12,
+      perLevelCounterSpin: true,
+      alternateSpinDir: false,
+
+      // Bloom
+      enableBloom: true,
+      bloomStrength: 1.35,
+      bloomRadius: 0.35,
+      bloomThreshold: 0.68,
+      electricIntensity: 1.0,
+
+      // Music
+      enableMusic: false,
+      musicVolume: 0.6,
+      noteLengthSec: 0.16,
+      scaleRoot: 'C',
+      baseOctave: 3,
+      scaleType: 'Major pentatonic',
+      triggerAxes: 'X+Z'
+    };
+
+    // ---------- Scales ----------
+    const SCALES = {
+      'Major pentatonic': [0,2,4,7,9],
+      'Minor pentatonic': [0,3,5,7,10],
+      'Yo (bright pentatonic)': [0,2,5,7,9],
+      'Kumoi': [0,2,3,7,9],
+      'Hirajōshi': [0,2,3,7,8],
+      'In Sen': [0,1,5,7,10],
+
+      'Dorian': [0,2,3,5,7,9,10],
+      'Mixolydian': [0,2,4,5,7,9,10],
+      'Lydian': [0,2,4,6,7,9,11],
+
+      'Harmonic minor': [0,2,3,5,7,8,11],
+      'Melodic minor': [0,2,3,5,7,9,11],
+      'Phrygian dominant': [0,1,4,5,7,8,10],
+
+      'Whole tone': [0,2,4,6,8,10],
+      'Octatonic (WH)': [0,2,3,5,6,8,9,11],
+      'Octatonic (HW)': [0,1,3,4,6,7,9,10]
+    };
+
+    // ---- functions used by presets/build ----
+    function colorModeToIndex(mode){
+      return mode === 'Rainbow (depth)' ? 1
+           : mode === 'White pulse'     ? 2
+           : mode === 'Electric pulse'  ? 3
+           : 0;
+    }
+    function updateModeUniforms(){
+      const idx = colorModeToIndex(params.colorMode);
+      for (const m of dynamicMats){
+        const sh = m.userData.shader; if (!sh) continue;
+        sh.uniforms.uMode.value = idx;
+        sh.uniforms.uRainbowSpan.value = params.rainbowSpanDeg;
+        sh.uniforms.uPulseWidth.value  = params.pulseWidth;
+      }
+    }
+    function updateElectricIntensityUniforms(){
+      for (const m of dynamicMats){
+        const sh = m.userData.shader;
+        if (sh && sh.uniforms.uElectricIntensity){
+          sh.uniforms.uElectricIntensity.value = params.electricIntensity;
+        }
+      }
+    }
+    function clearObj(obj){
+      for (let i = obj.children.length - 1; i >= 0; i--) {
+        const c = obj.children[i]; if (c.children) clearObj(c);
+        c.geometry && c.geometry.dispose && c.geometry.dispose();
+        obj.remove(c);
+      }
+    }
+    function estimateMeshes(depth, bps){ let total = 1, pow = 1; for (let i=1; i<=depth; i++){ pow *= bps; total += pow; } return total; }
+
+    function makeColorMaterial(level, startDist, segLen){
+      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.25, roughness: 0.5 });
+      const baseHueDeg = baseHueForLevel(level);
+      mat.onBeforeCompile = (shader)=>{
+        shader.uniforms.uTime        = { value: 0 };
+        shader.uniforms.uHueShift    = { value: 0 };
+        shader.uniforms.uBaseHueDeg  = { value: baseHueDeg };
+        shader.uniforms.uLevel       = { value: level };
+        shader.uniforms.uStartDist   = { value: startDist };
+        shader.uniforms.uSegLen      = { value: segLen };
+        shader.uniforms.uMode        = { value: colorModeToIndex(params.colorMode) };
+        shader.uniforms.uRainbowSpan = { value: params.rainbowSpanDeg };
+        shader.uniforms.uPulsePos    = { value: pulsePos };
+        shader.uniforms.uPulseWidth  = { value: params.pulseWidth };
+        shader.uniforms.uElectricIntensity = { value: params.electricIntensity };
+
+        // add vUv
+        if (!/varying\s+vec2\s+vUv\s*;/.test(shader.vertexShader)) {
+          shader.vertexShader = 'varying vec2 vUv;\n' + shader.vertexShader;
+        }
+        shader.vertexShader = shader.vertexShader.replace(/void\s+main\s*\(\)\s*\{/, m => m + '\n  vUv = uv;');
+        if (!/varying\s+vec2\s+vUv\s*;/.test(shader.fragmentShader)) {
+          shader.fragmentShader = 'varying vec2 vUv;\n' + shader.fragmentShader;
+        }
+
+        // helpers
+        shader.fragmentShader = shader.fragmentShader.replace('#include <common>', `#include <common>
+          uniform float uTime, uHueShift, uBaseHueDeg, uLevel, uStartDist, uSegLen, uRainbowSpan, uPulsePos, uPulseWidth, uElectricIntensity;
+          uniform int uMode;
+          float hash(vec2 p){ p=vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3))); return fract(sin(p.x+p.y)*43758.5453123); }
+          vec3 hsl2rgb(vec3 hsl){
+            float h=hsl.x,s=hsl.y,l=hsl.z; float c=(1.0-abs(2.0*l-1.0))*s; float hp=mod(h*6.0,6.0); float x=c*(1.0-abs(mod(hp,2.0)-1.0));
+            vec3 rgb; if(hp<1.0) rgb=vec3(c,x,0.0); else if(hp<2.0) rgb=vec3(x,c,0.0); else if(hp<3.0) rgb=vec3(0.0,c,x);
+            else if(hp<4.0) rgb=vec3(0.0,x,c); else if(hp<5.0) rgb=vec3(x,0.0,c); else rgb=vec3(c,0.0,x);
+            float m=l-0.5*c; return rgb+m;
+          }
+        `);
+
+        // color assignment
+        shader.fragmentShader = shader.fragmentShader.replace(
+          /vec4\s+diffuseColor\s*=\s*vec4\s*\(\s*diffuse\s*,\s*opacity\s*\)\s*;/,
+          `vec4 diffuseColor = vec4(diffuse, opacity);
+           float v = clamp(vUv.y, 0.0, 1.0);
+           float hue = mod((uBaseHueDeg + uHueShift)/360.0, 1.0);
+           float sat = 0.90, lit = 0.55;
+           if (uMode == 1) { hue = mod(hue + (uRainbowSpan/360.0) * v, 1.0); }
+           vec3 col = hsl2rgb(vec3(hue, sat, lit));
+           if (uMode == 2) {
+             float distAlong = uStartDist + v * uSegLen;
+             float w = smoothstep(uPulseWidth, 0.0, abs(distAlong - uPulsePos));
+             col = mix(col, vec3(1.0), w);
+           }
+           diffuseColor.rgb = col;`
+        );
+
+        // electric emissive
+        shader.fragmentShader = shader.fragmentShader.replace('#include <emissivemap_fragment>', `
+          #include <emissivemap_fragment>
+          if (uMode == 3) {
+            float distAlong = uStartDist + clamp(vUv.y,0.0,1.0) * uSegLen;
+            float w = smoothstep(uPulseWidth, 0.0, abs(distAlong - uPulsePos));
+            float flick = 0.7 + 0.3 * sin(uTime * 60.0 + vUv.x * 40.0 + uLevel * 1.7);
+            float core = pow(w, 2.2);
+            float aura = w * 0.65;
+            float s = hash(vUv * vec2(173.3,127.1) + uLevel) * (0.9 + 0.1*sin(uTime*45.0));
+            float spark = step(0.97, s) * w * 2.0;
+            vec3 electricCol = vec3(0.4, 0.9, 2.0);
+            vec3 e = electricCol * (core * 2.6 + aura * 0.8 + spark) * flick * uElectricIntensity;
+            totalEmissiveRadiance += e;
+          }
+        `);
+
+        mat.userData.shader = shader;
+      };
+      dynamicMats.push(mat);
+      return mat;
+    }
+
+    function addArcLocal(parent, P_local, T_local, N_local, radius, arcAngleRad, tubeRadius, tubularSegments, radialSegments, level, startDist){
+      const { t: Tn, n: Nn } = orthonormalize(T_local, N_local);
+      const qOrient = quatFromTN(Tn, Nn);
+      const curve = new LocalArcCurve(radius, arcAngleRad);
+      const geom = new THREE.TubeGeometry(curve, Math.max(2, tubularSegments|0), tubeRadius, Math.max(3, radialSegments|0), false);
+      const segLen = radius * arcAngleRad;
+      const mat = makeColorMaterial(level, startDist, segLen);
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.copy(P_local); mesh.quaternion.copy(qOrient); parent.add(mesh);
+      const endLocal = curve.getPoint(1).clone();
+      const tanLocal = curve.getTangent(1).clone();
+      totalPathLen = Math.max(totalPathLen, startDist + segLen);
+      return { mesh, endLocal, tanLocal, segLen };
+    }
+
+    function makeChildPivotOnSegment(segmentMesh, endLocal, tanLocal, level){
+      const pivot = new THREE.Group();
+      pivot.position.copy(endLocal);
+      const q = new THREE.Quaternion().setFromUnitVectors(Y_UNIT, tanLocal.clone().normalize());
+      pivot.quaternion.copy(q);
+      segmentMesh.add(pivot);
+      spinners.push({ pivot, level, lastXSign: 0, lastZSign: 0, lastTimeX: -1e9, lastTimeZ: -1e9 });
+      return pivot;
+    }
+
+    function syncBranchesLock(){
+      if (params.lockBranchesToAzimuth){
+        params.branchesPerSplit = Math.max(1, Math.floor(360 / Math.max(5, params.branchAzimuthDeg)));
+      }
+    }
+    function applyScalePreset(){
+      const k = params.scalePreset; if (k === 'custom') return;
+      const [name, powStr] = k.split('^-'); const p = Math.max(1, parseInt(powStr||'1',10));
+      const base = name === 'phi' ? PHI : (name === 'silver' ? SILVER : (name === 'plastic' ? PLASTIC : PHI));
+      params.scalePerLevel = 1 / (base ** p);
+    }
+    function applyPresetCommon(){
+      params.lockBranchesToAzimuth = true;
+      params.thickness = 0.072;
+      params.colorDrift = true; params.colorDriftSpeed = 0.5;
+      params.pulseSpeed = 2.0; params.pulseWidth = 0.83;
+      params.spinSpeedDegPerSec = 12; params.spinRoot = true;
+      params.perLevelCounterSpin = true; params.alternateSpinDir = false;
+    }
+    function applyPresetByName(name){
+      if (name === 'Phi 120'){    params.depth = 7; params.arcAngleDeg = 120; params.branchAzimuthDeg = 120; params.scalePreset = 'phi^-1';
+      } else if (name === 'Phi 90'){ params.depth = 5; params.arcAngleDeg = 90;  params.branchAzimuthDeg = 90;  params.scalePreset = 'phi^-1';
+      } else if (name === 'Phi 144'){params.depth = 4; params.arcAngleDeg = 144; params.branchAzimuthDeg = 72;  params.scalePreset = 'phi^-2';
+      } else if (name === 'Phi 72'){ params.depth = 7; params.arcAngleDeg = 72;  params.branchAzimuthDeg = 120; params.scalePreset = 'phi^-1';
+      } else if (name === 'Silver 120'){ params.depth = 4; params.arcAngleDeg = 120; params.branchAzimuthDeg = 60; params.scalePreset = 'silver^-1';
+      } else if (name === 'Silver 180'){ params.depth = 5; params.arcAngleDeg = 180; params.branchAzimuthDeg = 72; params.scalePreset = 'silver^-1';
+      }
+      applyPresetCommon();
+      applyScalePreset();
+      syncBranchesLock();
+      buildTree();
+      updateModeUniforms();
+      updateElectricIntensityUniforms();
+      resetMusicSigns();
+    }
+
+    function buildTree(){
+      clearObj(root);
+      spinners = [];
+      dynamicMats = [];
+      totalPathLen = 0;
+
+      const depth = Math.min(7, params.depth|0);
+      const branchStepDeg = Math.max(5, params.branchAzimuthDeg);
+      const branchesPerSplit = params.lockBranchesToAzimuth
+        ? Math.max(1, Math.floor(360 / Math.max(5, params.branchAzimuthDeg)))
+        : (params.branchesPerSplit|0);
+
+      const est = estimateMeshes(depth, branchesPerSplit);
+      if (est > params.maxMeshEstimate){ console.warn(`Build skipped: estimated ${est} meshes > cap (${params.maxMeshEstimate}).`); return; }
+
+      const arcAngleRad = THREE.MathUtils.degToRad(params.arcAngleDeg);
+      const tubeBase = Math.max(0.003, params.thickness);
+      const tubularSegments = params.tubularSegments|0, radialSegments = params.radialSegments|0;
+      const radius0 = Math.max(0.05, params.radiusStart);
+
+      // trunk
+      const trunk = addArcLocal(root, new THREE.Vector3(0,0.01,0), Y_UNIT, Z_UNIT,
+                                radius0, arcAngleRad, tubeBase, tubularSegments, radialSegments, 0, 0);
+      const trunkPivot = makeChildPivotOnSegment(trunk.mesh, trunk.endLocal, trunk.tanLocal, 1);
+
+      // DFS stack
+      const stack = [];
+      stack.push({ level:1, parentPivot:trunkPivot, r: radius0*params.scalePerLevel, t: tubeBase*0.9, arcAngleRad, startDist: trunk.segLen });
+
+      while (stack.length){
+        const { level, parentPivot, r, t, arcAngleRad, startDist } = stack.pop();
+        if (level > depth) continue;
+
+        for (let i=0; i<branchesPerSplit; i++){
+          const azDeg = i * branchStepDeg;
+          const qAz = new THREE.Quaternion().setFromAxisAngle(Y_UNIT, THREE.MathUtils.degToRad(azDeg));
+          const N_final = Z_UNIT.clone().applyQuaternion(qAz);
+
+          const seg = addArcLocal(parentPivot, new THREE.Vector3(0,0,0), Y_UNIT, N_final,
+                                  r, arcAngleRad, Math.max(0.002, t), tubularSegments, radialSegments, level, startDist);
+
+          const childPivot = makeChildPivotOnSegment(seg.mesh, seg.endLocal, seg.tanLocal, level+1);
+
+          stack.push({
+            level: level+1,
+            parentPivot: childPivot,
+            r: r * params.scalePerLevel,
+            t: t * params.scalePerLevel * 0.92,
+            arcAngleRad,
+            startDist: startDist + seg.segLen
+          });
+        }
+      }
+      updateModeUniforms();
+      updateElectricIntensityUniforms();
+      resetMusicSigns();
+    }
+
+    function resetMusicSigns(){
+      for (const s of spinners){
+        s.pivot.getWorldPosition(tmpV);
+        s.lastXSign = signNonZero(tmpV.x);
+        s.lastZSign = signNonZero(tmpV.z);
+        s.lastTimeX = -1e9; s.lastTimeZ = -1e9;
+      }
+      levelNoteStep.clear();
+    }
+
+    // ---------- GUI ----------
+    const gui = new GUI({ title: 'Arc-Fractal Tree' });
+
+    const gPresets = gui.addFolder('Presets');
+    gPresets.add(params, 'preset', [
+      'Custom','Phi 120','Phi 90','Phi 144','Phi 72','Silver 120','Silver 180'
+    ]).name('Choose preset').onChange(v=>{ if (v !== 'Custom') applyPresetByName(v); });
+
+    const gStruct = gui.addFolder('Structure');
+    gStruct.add(params, 'depth', 0, 7, 1).name('Depth').onChange(()=>{ buildTree(); resetMusicSigns(); });
+    gStruct.add(params, 'arcAngleDeg', 5, 270, 1).name('Arc angle (°)').onChange(()=>{ buildTree(); resetMusicSigns(); });
+    gStruct.add(params, 'branchAzimuthDeg', 5, 180, 1).name('Azimuth step (°)').onChange(()=>{ syncBranchesLock(); buildTree(); resetMusicSigns(); });
+    gStruct.add(params, 'lockBranchesToAzimuth').name('Lock branches = 360/step').onChange(()=>{ syncBranchesLock(); buildTree(); resetMusicSigns(); });
+
+    const scaleOptions = [
+      'phi^-1','phi^-2','phi^-3','phi^-4',
+      'silver^-1','silver^-2','silver^-3','silver^-4',
+      'plastic^-1','plastic^-2','plastic^-3','plastic^-4',
+      'custom'
+    ];
+    const gScale = gui.addFolder('Scaling');
+    gScale.add(params, 'scalePreset', scaleOptions).name('Scale preset').onChange(()=>{ applyScalePreset(); buildTree(); resetMusicSigns(); });
+    gScale.add(params, 'scalePerLevel', 0.1, 0.9, 0.0001).name('Scale per level').onChange(()=>{ buildTree(); resetMusicSigns(); });
+
+    const gGeom = gui.addFolder('Geometry');
+    gGeom.add(params, 'thickness', 0.01, 0.5, 0.001).name('Tube thickness').onChange(()=>{ buildTree(); resetMusicSigns(); });
+    gGeom.add(params, 'radiusStart', 0.2, 4.0, 0.01).name('Start radius').onChange(()=>{ buildTree(); resetMusicSigns(); });
+    gGeom.add(params, 'tubularSegments', 8, 128, 1).name('Arc segments').onChange(()=>{ buildTree(); resetMusicSigns(); });
+    gGeom.add(params, 'radialSegments', 3, 24, 1).name('Tube sides').onChange(()=>{ buildTree(); resetMusicSigns(); });
+
+    const gColor = gui.addFolder('Color');
+    gColor.add(params, 'colorDrift').name('Enable color drift');
+    gColor.add(params, 'colorDriftSpeed', 0.05, 5.0, 0.05).name('Drift speed');
+    gColor.add(params, 'colorMode', ['Solid','Rainbow (depth)','White pulse','Electric pulse']).name('Color mode').onChange(updateModeUniforms);
+    gColor.add(params, 'rainbowSpanDeg', 0, 360, 1).name('Rainbow span (°)').onChange(updateModeUniforms);
+    gColor.add(params, 'pulseSpeed', 0.1, 20.0, 0.1).name('Pulse speed').onChange(updateModeUniforms);
+    gColor.add(params, 'pulseWidth', 0.01, 5.0, 0.01).name('Pulse width').onChange(updateModeUniforms);
+
+    const gMotion = gui.addFolder('Motion');
+    gMotion.add(params, 'spinRoot').name('Spin root (global)');
+    gMotion.add(params, 'perLevelCounterSpin').name('Per-level spin (hier)');
+    gMotion.add(params, 'alternateSpinDir').name('Alternate direction');
+    gMotion.add(params, 'spinSpeedDegPerSec', 1, 180, 1).name('Base speed (°/s)');
+
+    const gBloom = gui.addFolder('Electric Bloom');
+    gBloom.add(params, 'enableBloom').name('Enable bloom');
+    gBloom.add(params, 'bloomStrength', 0.0, 3.0, 0.01).name('Strength').onChange(()=> bloomPass.strength = params.bloomStrength);
+    gBloom.add(params, 'bloomRadius',   0.0, 1.0, 0.01).name('Radius').onChange(()=> bloomPass.radius = params.bloomRadius);
+    gBloom.add(params, 'bloomThreshold',0.0, 1.2, 0.01).name('Threshold').onChange(()=> bloomPass.threshold = params.bloomThreshold);
+    gBloom.add(params, 'electricIntensity', 0.0, 3.0, 0.01).name('Electric intensity').onChange(updateElectricIntensityUniforms);
+
+    // ---------- MUSIC (Web Audio) ----------
+    let audioCtx = null, masterGain = null, comp = null;
+    const NOTE_TO_SEMITONE = { C:0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,F:5,'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11 };
+
+    const gMusic = gui.addFolder('Music');
+    gMusic.add(params, 'enableMusic').name('Enable music');
+    gMusic.add(params, 'musicVolume', 0, 1, 0.01).name('Volume');
+    gMusic.add(params, 'noteLengthSec', 0.05, 0.6, 0.01).name('Note length (s)');
+    gMusic.add(params, 'scaleRoot', ['C','D','E','F','G','A','B']).name('Scale root');
+    gMusic.add(params, 'baseOctave', 1, 6, 1).name('Base octave'); // min 1
+    gMusic.add(params, 'scaleType', Object.keys(SCALES)).name('Scale');
+    gMusic.add(params, 'triggerAxes', ['X+Z','X only','Z only']).name('Trigger axes');
+
+    function midiToHz(m){ return 440 * Math.pow(2, (m - 69)/12); }
+    function rootMidi(root, octave){ return 12 * (octave + 1) + NOTE_TO_SEMITONE[root]; }
+
+    function ensureAudio(){
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      comp = audioCtx.createDynamicsCompressor();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = params.musicVolume;
+      comp.connect(masterGain).connect(audioCtx.destination);
+    }
+
+    // One audio button listener (kept here for recorder access)
+    document.getElementById('audioBtn').addEventListener('click', async ()=>{
+      ensureAudio(); await audioCtx.resume(); if (masterGain) masterGain.gain.value = params.musicVolume;
+    });
+
+    function playNoteForLevel(level){
+      if (!params.enableMusic || !audioCtx || audioCtx.state !== 'running') return;
+
+      const intervals = SCALES[params.scaleType] || SCALES['Major pentatonic'];
+      const step = (levelNoteStep.get(level) ?? 0) % intervals.length;
+      levelNoteStep.set(level, step + 1);
+
+      const octOffset = Math.floor(level / 2);
+      const base = rootMidi(params.scaleRoot, params.baseOctave + octOffset);
+      const midi = base + intervals[step];
+      const f = midiToHz(midi);
+
+      const t = audioCtx.currentTime + 0.002;
+      const osc = audioCtx.createOscillator(); osc.type = 'triangle'; osc.frequency.setValueAtTime(f, t);
+      const bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.setValueAtTime(f*1.2, t); bp.Q.setValueAtTime(8, t);
+      const g = audioCtx.createGain(); g.gain.setValueAtTime(0.0, t);
+      const A=0.005, D=Math.max(0.03, params.noteLengthSec*0.6), R=Math.max(0.03, params.noteLengthSec*0.4);
+      g.gain.linearRampToValueAtTime(0.9, t+A);
+      g.gain.linearRampToValueAtTime(0.0, t+A+D);
+      g.gain.linearRampToValueAtTime(0.0, t+A+D+R);
+      osc.connect(bp).connect(g).connect(comp);
+      osc.start(t); osc.stop(t + A + D + R + 0.02);
+    }
+
+    // ===== Recorder v2 (placed right after audioBtn listener) =====
+    let mediaDest = null;           // WebAudio -> MediaStreamDestination
+    let rec = null;                 // MediaRecorder
+    let recChunks = [];
+    let recBadge = null;
+    let recTimerId = null;
+    let recStartTs = 0;
+
+    function ensureMediaDest() {
+      ensureAudio();
+      if (!mediaDest) {
+        mediaDest = audioCtx.createMediaStreamDestination();
+        // Tee compressor to both speakers and recorder
+        comp.connect(mediaDest);
+      }
+      return mediaDest.stream;
+    }
+    function isSupported() { return 'MediaRecorder' in window; }
+    function chooseType(candidates) {
+      if (!isSupported() || !window.MediaRecorder.isTypeSupported) return '';
+      for (const t of candidates) { if (!t || MediaRecorder.isTypeSupported(t)) return t; }
+      return '';
+    }
+    function showRecBadge(kind='AUDIO') {
+      if (!recBadge) {
+        recBadge = document.createElement('div');
+        recBadge.style.cssText = `
+          position:fixed; right:14px; top:14px; z-index:20;
+          font:12px/1.1 ui-sans-serif,system-ui; color:#fff; background:rgba(0,0,0,.55);
+          padding:6px 10px; border:1px solid #e33; border-radius:10px;
+          display:flex; gap:8px; align-items:center; backdrop-filter: blur(4px);
+        `;
+        const dot = document.createElement('div');
+        dot.id = 'recDot';
+        dot.style.cssText = `
+          width:10px; height:10px; border-radius:50%;
+          background:#ff3b3b; box-shadow:0 0 10px #ff3b3b;
+          animation: recBlink 1s infinite;
+        `;
+        const txt = document.createElement('span');
+        txt.id = 'recTxt';
+        txt.textContent = `REC ${kind} 0:00`;
+        recBadge.appendChild(dot); recBadge.appendChild(txt);
+        document.body.appendChild(recBadge);
+
+        const style = document.createElement('style');
+        style.textContent = `@keyframes recBlink{0%,60%{opacity:1} 80%{opacity:.3} 100%{opacity:1}}`;
+        document.head.appendChild(style);
+      }
+      recBadge.querySelector('#recTxt').textContent = `REC ${kind} 0:00`;
+      recBadge.style.display = 'flex';
+      recStartTs = performance.now();
+      if (recTimerId) clearInterval(recTimerId);
+      recTimerId = setInterval(()=>{
+        const t = Math.max(0, performance.now() - recStartTs)/1000|0;
+        const m = (t/60|0).toString();
+        const s = (t%60).toString().padStart(2,'0');
+        recBadge.querySelector('#recTxt').textContent = `REC ${kind} ${m}:${s}`;
+      }, 250);
+    }
+    function hideRecBadge() {
+      if (recBadge) recBadge.style.display = 'none';
+      if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
+    }
+    function saveBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      setTimeout(()=> URL.revokeObjectURL(url), 4000);
+    }
+
+    function startAudioRecording() {
+      if (!isSupported()) { alert('MediaRecorder not supported in this browser.'); return; }
+      const stream = ensureMediaDest();
+      const mime = chooseType(['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/ogg','']);
+      recChunks = [];
+      try { rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {}); }
+      catch (e) { alert('Could not start audio recorder: ' + e); return; }
+      rec.onstart = ()=>{ console.log('Audio recording started, mime=', rec.mimeType); showRecBadge('AUDIO'); };
+      rec.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+      rec.onstop = ()=>{
+        hideRecBadge();
+        const type = rec.mimeType || mime || 'audio/webm';
+        const blob = new Blob(recChunks, { type });
+        if (!blob.size) { alert('No audio captured — is music enabled & sounding?'); return; }
+        saveBlob(blob, `arc-fractal-audio.${type.includes('ogg')?'ogg':'webm'}`);
+      };
+      rec.start();
+    }
+
+    function startVideoRecording() {
+      if (!isSupported()) { alert('MediaRecorder not supported in this browser.'); return; }
+      const audioStream = ensureMediaDest();
+      const canvasStream = renderer.domElement.captureStream(60); // change to 30 if heavy
+      const mixed = new MediaStream([...canvasStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
+      const mime = chooseType(['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','']);
+      recChunks = [];
+      try { rec = new MediaRecorder(mixed, mime ? { mimeType: mime } : {}); }
+      catch (e) { alert('Could not start video recorder: ' + e); return; }
+      rec.onstart = ()=>{ console.log('Video+audio recording started, mime=', rec.mimeType); showRecBadge('VIDEO'); };
+      rec.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+      rec.onstop = ()=>{
+        hideRecBadge();
+        const type = rec.mimeType || mime || 'video/webm';
+        const blob = new Blob(recChunks, { type });
+        if (!blob.size) { alert('No video captured — try again.'); return; }
+        saveBlob(blob, `arc-fractal-video.${type.includes('webm')?'webm':'webm'}`);
+      };
+      rec.start();
+    }
+
+    function stopRecording() {
+      if (rec && rec.state !== 'inactive') {
+        rec.stop();
+        console.log('Recording stopped.');
+      }
+    }
+
+    // Wire buttons
+    const recAudioBtn = document.getElementById('recAudioBtn');
+    const recVideoBtn = document.getElementById('recVideoBtn');
+    let isRecordingAudio = false;
+    let isRecordingVideo = false;
+
+    recAudioBtn?.addEventListener('click', async () => {
+      ensureAudio(); await audioCtx.resume();
+      if (!isRecordingAudio && !isRecordingVideo) {
+        startAudioRecording();
+        isRecordingAudio = true;
+        recAudioBtn.textContent = 'Stop audio';
+      } else {
+        stopRecording();
+        isRecordingAudio = false;
+        recAudioBtn.textContent = 'Rec audio';
+      }
+    });
+
+    recVideoBtn?.addEventListener('click', async () => {
+      ensureAudio(); await audioCtx.resume();
+      if (!isRecordingVideo && !isRecordingAudio) {
+        startVideoRecording();
+        isRecordingVideo = true;
+        recVideoBtn.textContent = 'Stop video';
+      } else {
+        stopRecording();
+        isRecordingVideo = false;
+        recVideoBtn.textContent = 'Rec video';
+      }
+    });
+    // ===== end Recorder v2 =====
+
+    // ---------- init from preset ----------
+    if (params.preset !== 'Custom') applyPresetByName(params.preset);
+    else { applyScalePreset(); syncBranchesLock(); buildTree(); }
+
+    // ---------- resize & loop ----------
+    window.addEventListener('resize', ()=>{
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+    });
+    window.addEventListener('keydown', (e)=>{
+      if (e.key.toLowerCase() === 's') {
+        const a = document.createElement('a');
+        a.href = renderer.domElement.toDataURL('image/png');
+        a.download = 'arc-fractal-tree.png';
+        a.click();
+      }
+    });
+
+    let _last = performance.now();
+    renderer.setAnimationLoop(()=>{
+      const now = performance.now();
+      const dt = Math.max(0, (now - _last) / 1000);
+      _last = now;
+
+      if (params.colorDrift) hueShiftDeg = (hueShiftDeg + params.colorDriftSpeed) % 360;
+      if (params.spinRoot) root.rotation.y += THREE.MathUtils.degToRad(params.spinSpeedDegPerSec) * dt;
+
+      if (params.perLevelCounterSpin) {
+        const base = THREE.MathUtils.degToRad(params.spinSpeedDegPerSec);
+        for (const s of spinners){
+          const factor = (s.level + 1);
+          const dir = params.alternateSpinDir ? ((s.level % 2) ? -1 : 1) : 1;
+          s.pivot.rotateOnAxis(Y_UNIT, base * factor * dir * dt);
+        }
+      }
+
+      const modeIdx = colorModeToIndex(params.colorMode);
+      if (modeIdx === 2 || modeIdx === 3) { // white/electric pulse advance
+        pulsePos = (pulsePos + params.pulseSpeed * dt);
+        if (pulsePos > totalPathLen) pulsePos -= totalPathLen;
+      }
+
+      for (const m of dynamicMats){
+        const sh = m.userData.shader; if (!sh) continue;
+        sh.uniforms.uTime.value        = now * 0.001;
+        sh.uniforms.uHueShift.value    = hueShiftDeg;
+        sh.uniforms.uMode.value        = modeIdx;
+        sh.uniforms.uRainbowSpan.value = params.rainbowSpanDeg;
+        sh.uniforms.uPulsePos.value    = pulsePos;
+        sh.uniforms.uPulseWidth.value  = params.pulseWidth;
+      }
+
+      // centerline music
+      if (params.enableMusic && audioCtx && audioCtx.state === 'running'){
+        const cooldown = 0.09;
+        const checkX = params.triggerAxes !== 'Z only';
+        const checkZ = params.triggerAxes !== 'X only';
+        for (const s of spinners){
+          s.pivot.getWorldPosition(tmpV);
+          if (checkX){
+            const sx = signNonZero(tmpV.x);
+            if (sx !== 0 && s.lastXSign !== 0 && sx !== s.lastXSign){
+              const tNow = audioCtx.currentTime; if (tNow - s.lastTimeX > cooldown) { playNoteForLevel(s.level); s.lastTimeX = tNow; }
+            }
+            if (sx !== 0) s.lastXSign = sx;
+          }
+          if (checkZ){
+            const sz = signNonZero(tmpV.z);
+            if (sz !== 0 && s.lastZSign !== 0 && sz !== s.lastZSign){
+              const tNow = audioCtx.currentTime; if (tNow - s.lastTimeZ > cooldown) { playNoteForLevel(s.level); s.lastTimeZ = tNow; }
+            }
+            if (sz !== 0) s.lastZSign = sz;
+          }
+        }
+      }
+
+      controls.update();
+      if (params.enableBloom) composer.render(); else renderer.render(scene, camera);
+    });
+
+    // UI buttons
+    document.getElementById('resetBtn').addEventListener('click', ()=>{
+      camera.position.set(5, 5, 10);
+      controls.target.set(0, 1.5, 0);
+      controls.update();
+    });
+  </script>
+</body>
+</html>
